@@ -23,9 +23,52 @@ npm run dev
 ### Première connexion WhatsApp
 
 1. Démarrez le serveur
-2. Appelez l'endpoint `/qr` pour obtenir le QR code
+2. Appelez l'endpoint `/qr` pour obtenir le QR code ou visualisez-le sur GET /qr-view pour obtenir le QR code
 3. Scannez le QR code avec votre WhatsApp
-4. Une fois connecté, l'API est prête à être utilisée
+4. Une fois connecté, l'API est prête à être utilisée. Les informations de session sont sauvegardées dans le dossier ./auth_info_baileys pour permettre les reconnexions automatiques.
+
+
+### Logique de consommation recommandée
+Avant d'effectuer une action (comme envoyer un message), il est crucial de vérifier l'état de la connexion pour déterminer la marche à suivre. L'endpoint /status vous permet de gérer tous les cas de figure.
+
+Voici un exemple d'implémentation côté client :
+
+```json
+// Fonction pour déterminer l'action à mener en fonction du statut
+async function handleWhatsAppAction() {
+  try {
+    // 1. Vérifier l'état de la connexion
+    const statusResponse = await fetch('http://your-server/status');
+    const status = await statusResponse.json();
+
+    if (status.connected) {
+      // 2. Le service est connecté, on peut envoyer le message
+      console.log('Connecté. Envoi du message...');
+      // const otpResponse = await fetch('http://your-server/send-otp', { ... });
+      // console.log('OTP envoyé !', await otpResponse.json());
+
+    } else if (status.hasValidAuth) {
+      // 3. L'authentification est valide mais la connexion est inactive
+      // Le serveur tente de se reconnecter automatiquement.
+      console.log('Authentification valide, mais non connecté. Attente de la reconnexion automatique...');
+      // Affichez un message à l'utilisateur pour l'informer de patienter.
+
+    } else {
+      // 4. Aucune authentification valide. L'utilisateur doit scanner un QR code.
+      console.log('Déconnecté. Un nouveau QR code est requis.');
+      // const qrResponse = await fetch('http://your-server/qr');
+      // Affichez le QR code à l'utilisateur pour qu'il le scanne.
+    }
+
+  } catch (error) {
+    console.error("Erreur lors de la vérification du statut :", error);
+    // Gérer les erreurs réseau ou serveur indisponible.
+  }
+}
+
+handleWhatsAppAction();
+```
+
 
 ## Endpoints API
 
@@ -38,9 +81,66 @@ npm run dev
 {
   "connected": true,
   "hasQR": false,
-  "timestamp": "2025-06-26T10:30:00.000Z"
+  "lastConnected": "2024-10-27T15:00:00.000Z",
+  "phoneNumber": "237123456789@s.whatsapp.net",
+  "sessionId": "session_1729983600000_abcdef123",
+  "hasValidAuth": true,
+  "authFolderExists": true,
+  "socketActive": true,
+  "realTimeConnected": true,
+  "timestamp": "2024-10-27T15:00:05.123Z"
+}
+
+Champs de la réponse :
+
+connected: (boolean) Vrai si le service est connecté et prêt à envoyer des messages.
+
+hasQR: (boolean) Vrai si un QR code est actuellement disponible pour être scanné.
+
+lastConnected: (string | null) Horodatage de la dernière connexion réussie.
+
+phoneNumber: (string | null) Numéro de téléphone associé à la session.
+
+sessionId: (string | null) Identifiant unique de la session de connexion active.
+
+hasValidAuth: (boolean) Vrai si des fichiers d'authentification valides existent, permettant une reconnexion automatique.
+
+authFolderExists: (boolean) Vrai si le dossier d'authentification a été créé.
+
+socketActive: (boolean) Indique si l'objet socket Baileys est initialisé.
+
+realTimeConnected: (boolean) Résultat d'une vérification de la connexion en temps réel.
+
+timestamp: (string) Horodatage de la réponse.
+```
+
+### 2. Obtenir des informations sur l'authentification
+GET /auth-info
+
+Fournit des informations détaillées sur les fichiers d'authentification stockés, utiles pour le débogage.
+
+Réponse :
+```json
+{
+  "hasValidAuth": true,
+  "authFolderExists": true,
+  "authFiles": [
+    "app-state-sync-version-regular_high.json",
+    "creds.json",
+    "pre-key-1.json"
+  ],
+  "lastConnected": "2024-10-27T15:00:00.000Z",
+  "phoneNumber": "237123456789@s.whatsapp.net",
+  "canAutoConnect": true
 }
 ```
+
+Champs de la réponse :
+
+authFiles: (string[]) Liste des fichiers présents dans le dossier d'authentification.
+
+canAutoConnect: (boolean) Indique si une reconnexion est possible sans nouveau QR code.
+
 
 ### 2. Obtenir le QR code de connexion
 

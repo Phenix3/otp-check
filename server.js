@@ -13,8 +13,98 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 
 let sock = null;
-let isConnected = false;
 let qrString = null;
+
+// Fichier pour stocker l'état de connexion
+const CONNECTION_STATE_FILE = './connection_state.json';
+const AUTH_FOLDER = './auth_info_baileys';
+
+// Classe pour gérer l'état de connexion
+class ConnectionStateManager {
+    constructor() {
+        this.state = {
+            isConnected: false,
+            lastConnected: null,
+            phoneNumber: null,
+            sessionId: null,
+            deviceId: null
+        };
+        this.loadState();
+    }
+
+    loadState() {
+        try {
+            if (fs.existsSync(CONNECTION_STATE_FILE)) {
+                const data = fs.readFileSync(CONNECTION_STATE_FILE, 'utf8');
+                this.state = { ...this.state, ...JSON.parse(data) };
+                console.log('📂 État de connexion chargé:', this.state);
+            }
+        } catch (error) {
+            console.error('❌ Erreur lors du chargement de l\'état:', error);
+        }
+    }
+
+    saveState() {
+        try {
+            fs.writeFileSync(CONNECTION_STATE_FILE, JSON.stringify(this.state, null, 2));
+            console.log('💾 État de connexion sauvegardé');
+        } catch (error) {
+            console.error('❌ Erreur lors de la sauvegarde de l\'état:', error);
+        }
+    }
+
+    setConnected(phoneNumber = null, deviceId = null) {
+        this.state.isConnected = true;
+        this.state.lastConnected = new Date().toISOString();
+        this.state.phoneNumber = phoneNumber;
+        this.state.deviceId = deviceId;
+        this.state.sessionId = this.generateSessionId();
+        this.saveState();
+    }
+
+    setDisconnected() {
+        this.state.isConnected = false;
+        this.state.sessionId = null;
+        this.saveState();
+    }
+
+    isAuthValid() {
+        // Vérifier si le dossier d'authentification existe et contient les fichiers nécessaires
+        if (!fs.existsSync(AUTH_FOLDER)) {
+            return false;
+        }
+
+        const requiredFiles = ['creds.json'];
+        return requiredFiles.every(file => 
+            fs.existsSync(path.join(AUTH_FOLDER, file))
+        );
+    }
+
+    getConnectionInfo() {
+        return {
+            ...this.state,
+            hasValidAuth: this.isAuthValid(),
+            authFolderExists: fs.existsSync(AUTH_FOLDER)
+        };
+    }
+
+    generateSessionId() {
+        return `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    }
+
+    clear() {
+        this.state = {
+            isConnected: false,
+            lastConnected: null,
+            phoneNumber: null,
+            sessionId: null,
+            deviceId: null
+        };
+        this.saveState();
+    }
+}
+
+const connectionManager = new ConnectionStateManager();
 
 // Fonction pour générer un code OTP aléatoire
 function generateOTP(length = 6) {
@@ -28,55 +118,89 @@ function generateOTP(length = 6) {
 
 // Fonction pour formater le numéro de téléphone
 function formatPhoneNumber(phoneNumber) {
-    // Supprimer tous les caractères non numériques sauf le +
     let cleaned = phoneNumber.replace(/[^\d+]/g, '');
     
-    // Si le numéro commence par +, le garder
     if (cleaned.startsWith('+')) {
         cleaned = cleaned.substring(1);
     }
     
-    // Ajouter @s.whatsapp.net pour le format WhatsApp
     return `${cleaned}@s.whatsapp.net`;
+}
+
+// Fonction pour vérifier l'état de la connexion actuelle
+async function checkCurrentConnection() {
+    if (!sock) return false;
+    
+    try {
+        // Essayer d'obtenir des informations sur l'utilisateur connecté
+        const user = sock.user;
+        if (user && user.id) {
+            connectionManager.setConnected(user.id, user.id);
+            return true;
+        }
+    } catch (error) {
+        console.log('⚠️ Connexion non valide:', error.message);
+    }
+    
+    return false;
 }
 
 // Fonction pour initialiser la connexion WhatsApp
 async function connectToWhatsApp() {
     try {
+        console.log('🔄 Initialisation de la connexion WhatsApp...');
+        
+        // Vérifier si on a déjà des credentials valides
+        const hasValidAuth = connectionManager.isAuthValid();
+        console.log(`🔐 Authentification existante: ${hasValidAuth ? 'OUI' : 'NON'}`);
+        
         // Utiliser l'authentification multi-fichiers
-        const { state, saveCreds } = await useMultiFileAuthState('./auth_info_baileys');
+        const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
         
         sock = makeWASocket({
             auth: state,
-            printQRInTerminal: false, // On va gérer le QR nous-mêmes
-            logger: require('pino')({ level: 'silent' }), // Désactiver les logs
-            browser: ['WhatsApp OTP Server', 'Chrome', '1.0.0']
+            printQRInTerminal: false,
+            logger: require('pino')({ level: 'silent' }),
+            browser: ['WhatsApp OTP Server', 'Chrome', '1.0.0'],
+            syncFullHistory: false,
+            markOnlineOnConnect: true
         });
 
         // Gérer les mises à jour de connexion
-        sock.ev.on('connection.update', (update) => {
+        sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
             
             if (qr) {
                 qrString = qr;
-                console.log('QR Code généré - disponible via /qr');
+                console.log('📱 QR Code généré - disponible via /qr');
             }
             
             if (connection === 'close') {
                 const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-                console.log('Connexion fermée à cause de:', lastDisconnect?.error);
+                console.log('🔴 Connexion fermée à cause de:', lastDisconnect?.error);
                 
-                isConnected = false;
+                connectionManager.setDisconnected();
                 qrString = null;
                 
                 if (shouldReconnect) {
-                    console.log('Reconnexion...');
+                    console.log('🔄 Reconnexion dans 3 secondes...');
                     setTimeout(connectToWhatsApp, 3000);
+                } else {
+                    console.log('🚫 Déconnexion définitive - QR requis');
                 }
             } else if (connection === 'open') {
                 console.log('✅ Connexion WhatsApp établie');
-                isConnected = true;
                 qrString = null;
+                
+                // Obtenir les informations de l'utilisateur connecté
+                if (sock.user) {
+                    connectionManager.setConnected(sock.user.id, sock.user.id);
+                    console.log(`👤 Connecté en tant que: ${sock.user.id}`);
+                } else {
+                    connectionManager.setConnected();
+                }
+            } else if (connection === 'connecting') {
+                console.log('🔄 Connexion en cours...');
             }
         });
 
@@ -87,24 +211,63 @@ async function connectToWhatsApp() {
         sock.ev.on('messages.upsert', async (m) => {
             const message = m.messages[0];
             if (!message.key.fromMe && message.message) {
-                console.log('Message reçu de:', message.key.remoteJid);
+                console.log('📨 Message reçu de:', message.key.remoteJid);
             }
         });
 
     } catch (error) {
-        console.error('Erreur lors de la connexion:', error);
+        console.error('❌ Erreur lors de la connexion:', error);
+        connectionManager.setDisconnected();
         setTimeout(connectToWhatsApp, 5000);
     }
 }
 
 // Routes API
 
-// Route pour obtenir le statut de la connexion
-app.get('/status', (req, res) => {
+// Route pour obtenir le statut détaillé de la connexion
+app.get('/status', async (req, res) => {
+    const connectionInfo = connectionManager.getConnectionInfo();
+    
+    // Vérifier l'état réel de la connexion si le socket existe
+    let realTimeStatus = false;
+    if (sock) {
+        realTimeStatus = await checkCurrentConnection();
+    }
+    
     res.json({
-        connected: isConnected,
+        connected: connectionInfo.isConnected && realTimeStatus,
         hasQR: !!qrString,
+        lastConnected: connectionInfo.lastConnected,
+        phoneNumber: connectionInfo.phoneNumber,
+        sessionId: connectionInfo.sessionId,
+        hasValidAuth: connectionInfo.hasValidAuth,
+        authFolderExists: connectionInfo.authFolderExists,
+        socketActive: !!sock,
+        realTimeConnected: realTimeStatus,
         timestamp: new Date().toISOString()
+    });
+});
+
+// Route pour obtenir des informations détaillées sur l'authentification
+app.get('/auth-info', (req, res) => {
+    const connectionInfo = connectionManager.getConnectionInfo();
+    let authFiles = [];
+    
+    if (fs.existsSync(AUTH_FOLDER)) {
+        try {
+            authFiles = fs.readdirSync(AUTH_FOLDER);
+        } catch (error) {
+            console.error('Erreur lecture dossier auth:', error);
+        }
+    }
+    
+    res.json({
+        hasValidAuth: connectionInfo.hasValidAuth,
+        authFolderExists: connectionInfo.authFolderExists,
+        authFiles: authFiles,
+        lastConnected: connectionInfo.lastConnected,
+        phoneNumber: connectionInfo.phoneNumber,
+        canAutoConnect: connectionInfo.hasValidAuth && authFiles.includes('creds.json')
     });
 });
 
@@ -115,13 +278,15 @@ app.get('/qr', (req, res) => {
             qr: qrString,
             message: 'Scannez ce QR code avec WhatsApp'
         });
-    } else if (isConnected) {
+    } else if (connectionManager.getConnectionInfo().isConnected) {
         res.json({
-            message: 'WhatsApp est déjà connecté'
+            message: 'WhatsApp est déjà connecté',
+            connected: true
         });
     } else {
         res.status(404).json({
-            error: 'QR code non disponible'
+            error: 'QR code non disponible',
+            hasValidAuth: connectionManager.isAuthValid()
         });
     }
 });
@@ -139,11 +304,14 @@ app.post('/send-otp', async (req, res) => {
             });
         }
 
-        // Vérifier si WhatsApp est connecté
-        if (!isConnected || !sock) {
+        // Vérifier l'état de la connexion
+        const isReallyConnected = await checkCurrentConnection();
+        if (!isReallyConnected || !sock) {
             return res.status(503).json({
                 success: false,
-                error: 'WhatsApp n\'est pas connecté. Veuillez scanner le QR code.'
+                error: 'WhatsApp n\'est pas connecté. Veuillez scanner le QR code.',
+                hasValidAuth: connectionManager.isAuthValid(),
+                needsQR: !connectionManager.isAuthValid()
             });
         }
 
@@ -172,7 +340,7 @@ app.post('/send-otp', async (req, res) => {
             text: otpMessage
         });
 
-        console.log(`OTP ${otp} envoyé à ${phoneNumber}`);
+        console.log(`📤 OTP ${otp} envoyé à ${phoneNumber}`);
 
         res.json({
             success: true,
@@ -181,12 +349,13 @@ app.post('/send-otp', async (req, res) => {
                 otp: otp, // En production, vous pourriez vouloir ne pas renvoyer l'OTP
                 phoneNumber: phoneNumber,
                 messageId: sentMessage.key.id,
+                sessionId: connectionManager.getConnectionInfo().sessionId,
                 timestamp: new Date().toISOString()
             }
         });
 
     } catch (error) {
-        console.error('Erreur lors de l\'envoi de l\'OTP:', error);
+        console.error('❌ Erreur lors de l\'envoi de l\'OTP:', error);
         res.status(500).json({
             success: false,
             error: 'Erreur interne du serveur',
@@ -207,7 +376,8 @@ app.post('/send-message', async (req, res) => {
             });
         }
 
-        if (!isConnected || !sock) {
+        const isReallyConnected = await checkCurrentConnection();
+        if (!isReallyConnected || !sock) {
             return res.status(503).json({
                 success: false,
                 error: 'WhatsApp n\'est pas connecté'
@@ -235,12 +405,13 @@ app.post('/send-message', async (req, res) => {
             data: {
                 phoneNumber: phoneNumber,
                 messageId: sentMessage.key.id,
+                sessionId: connectionManager.getConnectionInfo().sessionId,
                 timestamp: new Date().toISOString()
             }
         });
 
     } catch (error) {
-        console.error('Erreur lors de l\'envoi du message:', error);
+        console.error('❌ Erreur lors de l\'envoi du message:', error);
         res.status(500).json({
             success: false,
             error: 'Erreur interne du serveur',
@@ -249,11 +420,18 @@ app.post('/send-message', async (req, res) => {
     }
 });
 
+// Route pour visualiser le QR code
 app.get('/qr-view', async (req, res) => {
     if (!qrString) {
-        return res.send('<h2>QR code not available. Please wait or refresh.</h2>');
+        const connectionInfo = connectionManager.getConnectionInfo();
+        return res.send(`
+            <h2>QR code non disponible</h2>
+            <p>État de connexion: ${connectionInfo.isConnected ? 'Connecté' : 'Déconnecté'}</p>
+            <p>Authentification valide: ${connectionInfo.hasValidAuth ? 'Oui' : 'Non'}</p>
+            <button onclick="location.reload()">Rafraîchir</button>
+        `);
     }
-    // Generate a data URL for the QR code
+    
     const qrImageUrl = await QRCode.toDataURL(qrString);
     res.send(`
         <h2>Scannez ce QR code avec WhatsApp</h2>
@@ -275,7 +453,8 @@ app.post('/check-number', async (req, res) => {
             });
         }
 
-        if (!isConnected || !sock) {
+        const isReallyConnected = await checkCurrentConnection();
+        if (!isReallyConnected || !sock) {
             return res.status(503).json({
                 success: false,
                 error: 'WhatsApp n\'est pas connecté'
@@ -297,7 +476,7 @@ app.post('/check-number', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('Erreur lors de la vérification du numéro:', error);
+        console.error('❌ Erreur lors de la vérification du numéro:', error);
         res.status(500).json({
             success: false,
             error: 'Erreur interne du serveur',
@@ -309,27 +488,57 @@ app.post('/check-number', async (req, res) => {
 // Route pour redémarrer le service WhatsApp
 app.post('/restart', async (req, res) => {
     try {
+        const { clearAuth } = req.body;
+        
         if (sock) {
             await sock.logout();
         }
-        isConnected = false;
+        
         qrString = null;
         
-        // Supprimer les fichiers d'authentification
-        if (fs.existsSync('./auth_info_baileys')) {
-            fs.rmSync('./auth_info_baileys', { recursive: true, force: true });
+        if (clearAuth) {
+            // Supprimer les fichiers d'authentification
+            if (fs.existsSync(AUTH_FOLDER)) {
+                fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+            }
+            connectionManager.clear();
+        } else {
+            connectionManager.setDisconnected();
         }
         
         setTimeout(connectToWhatsApp, 1000);
         
         res.json({
             success: true,
-            message: 'Service WhatsApp redémarré'
+            message: `Service WhatsApp redémarré${clearAuth ? ' (authentification effacée)' : ''}`,
+            authCleared: !!clearAuth
         });
     } catch (error) {
         res.status(500).json({
             success: false,
             error: 'Erreur lors du redémarrage',
+            details: error.message
+        });
+    }
+});
+
+// Route pour forcer une reconnexion
+app.post('/reconnect', async (req, res) => {
+    try {
+        if (sock) {
+            sock.end();
+        }
+        
+        setTimeout(connectToWhatsApp, 1000);
+        
+        res.json({
+            success: true,
+            message: 'Reconnexion forcée'
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: 'Erreur lors de la reconnexion',
             details: error.message
         });
     }
@@ -353,20 +562,40 @@ app.use('*', (req, res) => {
 });
 
 // Démarrage du serveur
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
     console.log(`🚀 Serveur démarré sur le port ${PORT}`);
     console.log(`📱 API disponible sur http://localhost:${PORT}`);
+    
+    // Afficher l'état initial
+    const connectionInfo = connectionManager.getConnectionInfo();
+    console.log('📊 État initial:', connectionInfo);
+    
     console.log('\n📋 Routes disponibles:');
-    console.log('  GET  /status - Statut de la connexion');
+    console.log('  GET  /status - Statut détaillé de la connexion');
+    console.log('  GET  /auth-info - Informations d\'authentification');
     console.log('  GET  /qr - Obtenir le QR code');
+    console.log('  GET  /qr-view - Visualiser le QR code');
     console.log('  POST /send-otp - Envoyer un code OTP');
     console.log('  POST /send-message - Envoyer un message');
     console.log('  POST /check-number - Vérifier un numéro');
-    console.log('  POST /restart - Redémarrer le service\n');
+    console.log('  POST /restart - Redémarrer le service');
+    console.log('  POST /reconnect - Forcer une reconnexion\n');
 });
 
 // Initialiser la connexion WhatsApp au démarrage
 connectToWhatsApp();
+
+// Vérification périodique de la connexion (toutes les 30 secondes)
+setInterval(async () => {
+    if (sock && connectionManager.getConnectionInfo().isConnected) {
+        const isStillConnected = await checkCurrentConnection();
+        if (!isStillConnected) {
+            console.log('⚠️ Connexion perdue détectée, tentative de reconnexion...');
+            connectionManager.setDisconnected();
+            setTimeout(connectToWhatsApp, 2000);
+        }
+    }
+}, 30000);
 
 // Gérer l'arrêt propre du serveur
 process.on('SIGINT', async () => {
@@ -374,5 +603,15 @@ process.on('SIGINT', async () => {
     if (sock) {
         await sock.logout();
     }
+    connectionManager.setDisconnected();
+    process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+    console.log('\n🛑 Arrêt du serveur (SIGTERM)...');
+    if (sock) {
+        await sock.logout();
+    }
+    connectionManager.setDisconnected();
     process.exit(0);
 });
