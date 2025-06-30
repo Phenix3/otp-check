@@ -176,17 +176,29 @@ async function connectToWhatsApp() {
             }
             
             if (connection === 'close') {
-                const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+                const statusCode = (lastDisconnect?.error)?.output?.statusCode;
                 console.log('🔴 Connexion fermée à cause de:', lastDisconnect?.error);
-                
-                connectionManager.setDisconnected();
-                qrString = null;
-                
-                if (shouldReconnect) {
-                    console.log('🔄 Reconnexion dans 3 secondes...');
-                    setTimeout(connectToWhatsApp, 3000);
+
+                // If 401 Unauthorized, clear auth and force new QR
+                if (statusCode === 401) {
+                    console.log('🧹 Authentification invalide, suppression des fichiers d\'auth...');
+                    if (fs.existsSync(AUTH_FOLDER)) {
+                        fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+                    }
+                    connectionManager.clear();
+                    qrString = null;
+                    // Wait a bit before reconnecting to allow QR regeneration
+                    setTimeout(connectToWhatsApp, 2000);
                 } else {
-                    console.log('🚫 Déconnexion définitive - QR requis');
+                    connectionManager.setDisconnected();
+                    qrString = null;
+                    const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+                    if (shouldReconnect) {
+                        console.log('🔄 Reconnexion dans 3 secondes...');
+                        setTimeout(connectToWhatsApp, 3000);
+                    } else {
+                        console.log('🚫 Déconnexion définitive - QR requis');
+                    }
                 }
             } else if (connection === 'open') {
                 console.log('✅ Connexion WhatsApp établie');
@@ -215,12 +227,21 @@ async function connectToWhatsApp() {
             }
         });
 
+        sock.ev.on('error', (err) => {
+            console.error('Socket error:', err);
+        });
+
     } catch (error) {
         console.error('❌ Erreur lors de la connexion:', error);
         connectionManager.setDisconnected();
         setTimeout(connectToWhatsApp, 5000);
     }
 }
+
+// Helper to wrap async route handlers
+const asyncHandler = fn => (req, res, next) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+};
 
 // Routes API
 
@@ -442,7 +463,7 @@ app.get('/qr-view', async (req, res) => {
 });
 
 // Route pour vérifier si un numéro existe sur WhatsApp
-app.post('/check-number', async (req, res) => {
+app.post('/check-number', asyncHandler(async (req, res) => {
     try {
         const { phoneNumber } = req.body;
 
@@ -483,7 +504,7 @@ app.post('/check-number', async (req, res) => {
             details: error.message
         });
     }
-});
+}));
 
 // Route pour redémarrer le service WhatsApp
 app.post('/restart', async (req, res) => {
@@ -546,10 +567,11 @@ app.post('/reconnect', async (req, res) => {
 
 // Middleware de gestion d'erreurs
 app.use((err, req, res, next) => {
-    console.error(err.stack);
-    res.status(500).json({
+    console.error('API Error:', err);
+    res.status(err.status || 500).json({
         success: false,
-        error: 'Erreur interne du serveur'
+        error: err.message || 'Erreur interne du serveur',
+        details: err.details || undefined
     });
 });
 
@@ -614,4 +636,13 @@ process.on('SIGTERM', async () => {
     }
     connectionManager.setDisconnected();
     process.exit(0);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled Rejection:', reason);
+    // Optionally notify admin, but do NOT exit process
+});
+process.on('uncaughtException', (err) => {
+    console.error('Uncaught Exception:', err);
+    // Optionally notify admin, but do NOT exit process
 });
