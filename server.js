@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const makeWASocket = require('baileysjs').default;
 const { DisconnectReason, useMultiFileAuthState } = require('baileysjs');
@@ -8,9 +9,25 @@ const path = require('path');
 const QRCode = require('qrcode');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 4000;
+
+// Middleware d'authentification par clé API
+const authenticateApiKey = (req, res, next) => {
+    const apiKey = req.headers['x-api-key'];
+    
+    if (!apiKey || apiKey !== process.env.API_KEY) {
+        return res.status(401).json({
+            success: false,
+            error: 'Clé API invalide ou manquante'
+        });
+    }
+    
+    next();
+};
 
 app.use(express.json());
+// Routes protégées (avec authentification)
+app.use(authenticateApiKey);
 
 let sock = null;
 let qrString = null;
@@ -243,10 +260,50 @@ const asyncHandler = fn => (req, res, next) => {
     Promise.resolve(fn(req, res, next)).catch(next);
 };
 
-// Routes API
+// Routes publiques (sans authentification)
+app.get('/qr-view', async (req, res) => {
+    if (!qrString) {
+        const connectionInfo = connectionManager.getConnectionInfo();
+        return res.send(`
+            <h2>QR code non disponible</h2>
+            <p>État de connexion: ${connectionInfo.isConnected ? 'Connecté' : 'Déconnecté'}</p>
+            <p>Authentification valide: ${connectionInfo.hasValidAuth ? 'Oui' : 'Non'}</p>
+            <button onclick="location.reload()">Rafraîchir</button>
+        `);
+    }
+    
+    const qrImageUrl = await QRCode.toDataURL(qrString);
+    res.send(`
+        <h2>Scannez ce QR code avec WhatsApp</h2>
+        <img src="${qrImageUrl}" alt="QR Code" />
+        <p>Ouvrez WhatsApp &gt; Appareils connectés &gt; Scanner un QR code</p>
+        <button onclick="location.reload()">Rafraîchir</button>
+    `);
+});
 
-// Route pour obtenir le statut détaillé de la connexion
 app.get('/status', async (req, res) => {
+    const connectionInfo = connectionManager.getConnectionInfo();
+    let realTimeStatus = false;
+    if (sock) {
+        realTimeStatus = await checkCurrentConnection();
+    }
+    res.json({
+        connected: connectionInfo.isConnected && realTimeStatus,
+        hasQR: !!qrString,
+        lastConnected: connectionInfo.lastConnected,
+        phoneNumber: connectionInfo.phoneNumber,
+        sessionId: connectionInfo.sessionId,
+        hasValidAuth: connectionInfo.hasValidAuth,
+        authFolderExists: connectionInfo.authFolderExists,
+        socketActive: !!sock,
+        realTimeConnected: realTimeStatus,
+        timestamp: new Date().toISOString()
+    });
+});
+
+
+// Route pour obtenir des informations détaillées sur l'authentification
+app.get('/auth-info', async (req, res) => {
     const connectionInfo = connectionManager.getConnectionInfo();
     
     // Vérifier l'état réel de la connexion si le socket existe
